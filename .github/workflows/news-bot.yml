@@ -1,0 +1,85 @@
+# 저장소의 .github/workflows/news-bot.yml 위치에 넣는 파일입니다.
+name: news-bot
+
+on:
+  schedule:
+    # 5분마다 실행 (3분, 8분, 13분 ... 58분). 정각에는 GitHub이 붐벼서 조금 비켜 두었습니다.
+    # cron은 UTC 기준이지만 5분 간격이라 한국 시간과 상관없이 동일하게 동작합니다.
+    - cron: "3-58/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = 정상 실행, test = 텔레그램 테스트 메시지만 발송"
+        type: choice
+        options: [run, test]
+        default: run
+      backfill_hours:
+        description: "처음 실행할 때 몇 시간 전 기사부터 가져올지 (0~36)"
+        default: "0"
+      force_send:
+        description: "시간 칸과 상관없이 대기열을 지금 발송"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 실행이 겹치면 순서대로 처리 (상태 파일 충돌 방지)
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 상태 불러오기 (state 브랜치)
+        run: |
+          git fetch --depth=1 origin +refs/heads/state:refs/remotes/origin/state 2>/dev/null || true
+          if git rev-parse --verify -q refs/remotes/origin/state >/dev/null; then
+            git show refs/remotes/origin/state:state.json > state.json
+          fi
+
+      - name: 뉴스 수집 및 발송
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEWS_KEYWORDS: ${{ secrets.NEWS_KEYWORDS }}
+          NEWS_EXCLUDE: ${{ secrets.NEWS_EXCLUDE }}
+          MODE: ${{ inputs.mode }}
+          BACKFILL_HOURS: ${{ inputs.backfill_hours }}
+          FORCE_SEND: ${{ inputs.force_send }}
+          # 구글 뉴스에서 최근 몇 시간 기사만 볼지 (2h = 최근 2시간)
+          NEWS_WHEN: "2h"
+          # 발송 시간대와 간격(분). 바꾸고 싶으면 여기 숫자만 수정하세요.
+          SEND_START: "07:00"
+          SEND_END: "22:00"
+          SEND_INTERVAL: "30"
+        run: python news_bot.py
+
+      - name: 상태 저장 (state 브랜치, 매번 1개 커밋으로 덮어씀)
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          if git rev-parse --verify -q refs/remotes/origin/state >/dev/null \
+             && git show refs/remotes/origin/state:state.json | cmp -s - state.json; then
+            echo "상태 변경 없음"
+            exit 0
+          fi
+          cp state.json "$RUNNER_TEMP/state.json"
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git checkout -q --orphan state-new
+          git rm -rq --cached .
+          git clean -fdxq
+          cp "$RUNNER_TEMP/state.json" state.json
+          git add state.json
+          git commit -q -m "state"
+          git push -q --force origin HEAD:refs/heads/state
