@@ -39,11 +39,16 @@ KST = timezone(timedelta(hours=9))  # 한국은 서머타임이 없어서 고정
 GOOGLE_RSS = "https://news.google.com/rss/search"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/{method}"
 
-LOOKBACK_HOURS = 36      # 이보다 오래된 기사는 무시
+LOOKBACK_HOURS = 36      # 이보다 오래된 기사는 무시(대기열에 있어도 이 시간이 지나면 버림)
 SEEN_KEEP_HOURS = 48     # 중복 확인용 기록 보관 시간
 MSG_LIMIT = 3800         # 텔레그램 메시지 한 통에 보이는 글자수 여유 한도(공식 한도 4096)
-MAX_ITEMS_PER_MSG = 30   # 한 통에 담는 기사 수 상한(링크가 너무 많아지는 것을 방지)
+RAW_LIMIT = 7500         # 메시지 원본(링크 주소 포함) 길이 여유 한도
+                         # 텔레그램의 실제 제한은 약 9,500자로 알려져 있음(공식 문서에는 없음).
+                         # 구글 뉴스 링크가 길어서(건당 300~700자) 이 한도를 지키지 않으면
+                         # "Entities_too_long" 오류로 발송 자체가 거부된다.
+MAX_ITEMS_PER_MSG = 30   # 한 통에 담는 기사 수 상한(위 두 길이 한도와 별개의 안전장치)
 MAX_MESSAGES_PER_RUN = 10
+MAX_PENDING = 500        # 대기열 최대 크기(이 이상이면 오래된 것부터 버림 — 폭주 방지용 안전장치)
 TITLE_MAX = 200
 
 
@@ -242,7 +247,35 @@ def collect(cfg, state, now, search_fn):
     cutoff = now - timedelta(hours=SEEN_KEEP_HOURS)
     for key in [k for k, p in seen.items() if datetime.fromisoformat(p) < cutoff and k not in pending]:
         del seen[key]
+
+    prune_pending(state, now)
     return failures
+
+
+def prune_pending(state, now):
+    """대기열이 너무 오래됐거나 너무 커지면 오래된 것부터 버린다.
+
+    발송이 한동안 막혀 있었다면(예: 텔레그램 오류로 계속 실패) 대기열이
+    몇만 건까지 쌓일 수 있다. 이런 상태로 다시 보내기 시작하면 메시지가
+    수백 통씩 밀려 나가고, 내용도 이미 지난 뉴스라 의미가 없다.
+    그래서 너무 오래된 기사는 보내지 않고 버리고, 그래도 대기열이
+    MAX_PENDING을 넘으면 오래된 것부터 추가로 버려 최신 것만 남긴다.
+    """
+    pending = state["pending"]
+    floor = now - timedelta(hours=LOOKBACK_HOURS)
+    stale = [k for k, v in pending.items() if datetime.fromisoformat(v["p"]) < floor]
+    for k in stale:
+        del pending[k]
+
+    overflow = len(pending) - MAX_PENDING
+    if overflow > 0:
+        oldest = sorted(pending.items(), key=lambda kv: kv[1]["p"])[:overflow]
+        for k, _ in oldest:
+            del pending[k]
+        stale = stale + [k for k, _ in oldest]  # 로그용으로만 합침
+
+    if stale:
+        log(f"대기열 정리: 오래되었거나 넘쳐서 {len(stale)}건 버림 (남은 대기 {len(pending)}건)")
 
 
 # ----------------------------------------------------------------- 발송
@@ -258,7 +291,9 @@ def slot_id(now, cfg):
 
 
 def build_messages(items, keywords, now, limit=MSG_LIMIT):
-    """기사 목록을 키워드별로 묶어 텔레그램 메시지(들)로 만든다. [(text, [기사id,...]), ...]"""
+    """기사 목록을 키워드별로 묶어 텔레그램 메시지(들)로 만든다.
+    반환값: ([(text, [기사id,...]), ...], 보낼 수 없어 버린 기사id 목록)
+    """
     names = {kid(k): k for k in keywords}
     order = [kid(k) for k in keywords]
     groups = {}
@@ -274,6 +309,13 @@ def build_messages(items, keywords, now, limit=MSG_LIMIT):
         head = f"📰 뉴스 {total}건 · {now:%m/%d %H:%M}" + (" (이어서)" if cont else "")
         return [head], []
 
+    def too_big(candidate_lines):
+        joined = "\n".join(candidate_lines)
+        # 화면에 보이는 글자 수(4096자 한도)와, 링크 주소까지 합친 원본 길이
+        # (텔레그램의 비공식 ~9,500자 엔티티 한도) 둘 다 확인한다.
+        return visible_len(joined) > limit or len(joined) > RAW_LIMIT
+
+    dropped = []
     lines, ids = new_chunk(False)
     for tag in ordered:
         label = names.get(tag, "기타")
@@ -281,22 +323,29 @@ def build_messages(items, keywords, now, limit=MSG_LIMIT):
         for it in groups[tag]:
             line = f'• <a href="{esc_attr(it["l"])}">{esc(it["t"])}</a>'
             extra = (["", f"<b>{esc(label)}</b>"] if need_header else []) + [line]
-            if ids and (len(ids) >= MAX_ITEMS_PER_MSG or visible_len("\n".join(lines + extra)) > limit):
+            if ids and (len(ids) >= MAX_ITEMS_PER_MSG or too_big(lines + extra)):
                 chunks.append(("\n".join(lines), ids))
                 lines, ids = new_chunk(True)
                 extra = ["", f"<b>{esc(label)}</b>", line]
+            # 기사 하나(헤더 포함)만으로도 한도를 넘는 극단적인 경우: 이 기사는 버린다.
+            if too_big(lines + extra) and not ids:
+                dropped.append(it["i"])
+                need_header = False
+                continue
             lines += extra
             ids.append(it["i"])
             need_header = False
     if ids:
         chunks.append(("\n".join(lines), ids))
-    return chunks
+    return chunks, dropped
 
 
 def flush_pending(cfg, state, now, send_fn, sleep_fn=time.sleep):
     """대기열을 보낸다. 성공한 만큼만 대기열에서 지운다. 남은 기사 수를 돌려준다."""
     items = sorted(state["pending"].values(), key=lambda x: x["p"])
-    chunks = build_messages(items, cfg["keywords"], now)
+    chunks, dropped = build_messages(items, cfg["keywords"], now)
+    for i in dropped:  # 기사 하나만으로도 길이 한도를 넘는 경우(사실상 발생하지 않음)
+        state["pending"].pop(i, None)
     for n, (text, ids) in enumerate(chunks[:MAX_MESSAGES_PER_RUN]):
         if n:
             sleep_fn(3.5)  # 그룹/채널은 분당 약 20건 제한이 있어 간격을 둔다
